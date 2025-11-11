@@ -109,7 +109,7 @@ ID                         TITLE
 
 ## Task 1 – Bonus: Optimize `StartConversation()` performance
 ### Problem
-The StartConversation endpoint executed two sequential (and independent) API calls to OpenAI:
+The StartConversation endpoint executed two sequential (while independent) API calls to OpenAI:
 
 ```go
 // choose a title
