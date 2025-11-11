@@ -107,7 +107,102 @@ ID                         TITLE
 69137c4c28032f0e80507802   Barcelona current weather information
 ```
 
-## Task 1 (Bonus) – Optimize `StartConversation()` performance
+## Task 1 – Bonus: Optimize `StartConversation()` performance
+### Problem
+The StartConversation endpoint executed two sequential (and independent) API calls to OpenAI:
+
+```go
+// choose a title
+title, err := s.assist.Title(ctx, conversation)
+if err != nil {
+    slog.ErrorContext(ctx, "Failed to generate conversation title", "error", err)
+} else {
+    conversation.Title = title
+}
+
+// generate a reply
+reply, err := s.assist.Reply(ctx, conversation)
+if err != nil {
+    return nil, err
+}
+```
+
+Both methods perform independent remote requests:
+
+- Title generates a short summary of the user’s message.
+- Reply generates the assistant’s actual response.
+
+Since both depend only on the initial user message and not on each other, running them sequentially generates unnecessary latency: `total time ≈ title_time + reply_time`.
+
+### Solution
+
+Key design decisions:
+
+- Run title and reply generation concurrently using goroutines.
+- Use channels to collect both results safely, avoiding data races.
+- Preserve identical external behavior:
+    - If Title fails, use "Untitled conversation" as fallback.
+    - If Reply fails, return an internal error as before.
+- Store the final conversation once both operations have completed.
+
+Snippet of the updated logic:
+
+```go
+// Create a channel for each operation
+titleCh := make(chan string, 1)
+replyCh := make(chan struct {
+    val string
+    err error
+}, 1)
+
+// Run title generation in parallel
+go func() {
+    title, err := s.assist.Title(ctx, conversation)
+    if err != nil || strings.TrimSpace(title) == "" {
+        slog.ErrorContext(ctx, "Failed to generate conversation title", "error", err)
+        titleCh <- "Untitled conversation"
+        return
+    }
+    titleCh <- title
+}()
+
+// Run reply generation in parallel
+go func() {
+    reply, err := s.assist.Reply(ctx, conversation)
+    replyCh <- struct {
+        val string
+        err error
+    }{val: reply, err: err}
+}()
+
+// Wait for both results
+title := <-titleCh
+replyResult := <-replyCh
+if replyResult.err != nil {
+    return nil, twirp.InternalErrorWith(replyResult.err)
+}
+reply := replyResult.val
+
+conversation.Title = title
+
+```
+
+### Result
+
+Now the interaction with OpenAI for the title and the respoinse is done at the same time, this can be seen on the server's console:
+
+```text
+2025/11/11 21:36:39 INFO Starting the server...
+2025/11/11 21:37:09 INFO Generating reply for conversation conversation_id=69139e750192fa6b9b0b3f50
+2025/11/11 21:37:09 INFO Generating title for conversation conversation_id=69139e750192fa6b9b0b3f50
+2025/11/11 21:37:11 INFO HTTP request complete http_method=POST http_path=/twirp/acai.chat.ChatService/StartConversation http_status=200
+```
+Both the generation of the title and the response start at the sema time
+
+- Before: two blocking network calls → `total latency ≈ title + reply`
+- After: concurrent execution → `total latency ≈ max(title, reply)`
+
+This change improves responsiveness while keeping the same functionality and database flow intact.
 
 ## Task 2
 
