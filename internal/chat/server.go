@@ -47,19 +47,43 @@ func (s *Server) StartConversation(ctx context.Context, req *pb.StartConversatio
 		return nil, twirp.RequiredArgumentError("message")
 	}
 
-	// choose a title
-	title, err := s.assist.Title(ctx, conversation)
-	if err != nil {
-		slog.ErrorContext(ctx, "Failed to generate conversation title", "error", err)
-	} else {
-		conversation.Title = title
-	}
+	// Create a channel for each operation
+	titleCh := make(chan string, 1)
+	replyCh := make(chan struct {
+		val string
+		err error
+	}, 1)
 
-	// generate a reply
-	reply, err := s.assist.Reply(ctx, conversation)
-	if err != nil {
-		return nil, err
+	// Run title generation in parallel
+	go func() {
+		title, err := s.assist.Title(ctx, conversation)
+		if err != nil || strings.TrimSpace(title) == "" {
+			slog.ErrorContext(ctx, "Failed to generate conversation title", "error", err)
+			titleCh <- "Untitled conversation"
+			return
+		}
+		titleCh <- title
+	}()
+
+	// Run reply generation in parallel
+	go func() {
+		reply, err := s.assist.Reply(ctx, conversation)
+		replyCh <- struct {
+			val string
+			err error
+		}{val: reply, err: err}
+	}()
+
+	// Wait for both results
+	title := <-titleCh
+	replyResult := <-replyCh
+	if replyResult.err != nil {
+		return nil, twirp.InternalErrorWith(replyResult.err)
 	}
+	reply := replyResult.val
+
+	conversation.Title = title
+
 
 	conversation.Messages = append(conversation.Messages, &model.Message{
 		ID:        primitive.NewObjectID(),
