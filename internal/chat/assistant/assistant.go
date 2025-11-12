@@ -8,8 +8,11 @@ import (
 	"os"
 	"strings"
 	"time"
+	"fmt"
 
 	"github.com/acai-travel/tech-challenge/internal/chat/model"
+	"github.com/acai-travel/tech-challenge/internal/tools"
+
 	ics "github.com/arran4/golang-ical"
 	"github.com/openai/openai-go/v2"
 )
@@ -99,6 +102,7 @@ func (a *Assistant) Reply(ctx context.Context, conv *model.Conversation) (string
 			Model:    openai.ChatModelGPT4_1,
 			Messages: msgs,
 			Tools: []openai.ChatCompletionToolUnionParam{
+
 				openai.ChatCompletionFunctionTool(openai.FunctionDefinitionParam{
 					Name:        "get_weather",
 					Description: openai.String("Get weather at the given location"),
@@ -112,6 +116,7 @@ func (a *Assistant) Reply(ctx context.Context, conv *model.Conversation) (string
 						"required": []string{"location"},
 					},
 				}),
+
 				openai.ChatCompletionFunctionTool(openai.FunctionDefinitionParam{
 					Name:        "get_today_date",
 					Description: openai.String("Get today's date and time in RFC3339 format"),
@@ -155,10 +160,32 @@ func (a *Assistant) Reply(ctx context.Context, conv *model.Conversation) (string
 				slog.InfoContext(ctx, "Tool call received", "name", call.Function.Name, "args", call.Function.Arguments)
 
 				switch call.Function.Name {
+
 				case "get_weather":
-					msgs = append(msgs, openai.ToolMessage("weather is fine", call.ID))
+					var args struct {
+						Location string `json:"location"`
+					}
+					if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil || strings.TrimSpace(args.Location) == "" {
+						msgs = append(msgs, openai.ToolMessage("failed to parse arguments for get_weather", call.ID))
+						break
+					}
+
+					rep, err := weather.GetCurrent(ctx, args.Location)
+					if err != nil {
+						slog.ErrorContext(ctx, "weather fetch failed", "error", err)
+						msgs = append(msgs, openai.ToolMessage("failed to fetch weather", call.ID))
+						break
+					}
+
+					var b strings.Builder
+					fmt.Fprintf(&b, "Location: %s\n", rep.ResolvedName)
+					fmt.Fprintf(&b, "Current: %.1f°C, wind %.1f km/h, %s\n", rep.TemperatureC, rep.WindKph, rep.Condition)
+
+					msgs = append(msgs, openai.ToolMessage(b.String(), call.ID))
+
 				case "get_today_date":
 					msgs = append(msgs, openai.ToolMessage(time.Now().Format(time.RFC3339), call.ID))
+					
 				case "get_holidays":
 					link := "https://www.officeholidays.com/ics/spain/catalonia"
 					if v := os.Getenv("HOLIDAY_CALENDAR_LINK"); v != "" {
@@ -205,6 +232,7 @@ func (a *Assistant) Reply(ctx context.Context, conv *model.Conversation) (string
 					}
 
 					msgs = append(msgs, openai.ToolMessage(strings.Join(holidays, "\n"), call.ID))
+
 				default:
 					return "", errors.New("unknown tool call: " + call.Function.Name)
 				}
