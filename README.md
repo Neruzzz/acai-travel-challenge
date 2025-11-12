@@ -204,7 +204,142 @@ Both the generation of the title and the response start at the sema time
 
 This change improves responsiveness while keeping the same functionality and database flow intact.
 
-## Task 2
+## Task 2 – Fix the weather
+### Problem
+
+The existing `get_weather` tool in `assistant.go` did not fetch real weather information. Instead, it returned a static placeholder:
+
+```go
+case "get_weather":
+    msgs = append(msgs, openai.ToolMessage("weather is fine", call.ID))
+```
+
+Issues:
+
+- No external API integration, responses were always "the weather is fine".
+- The assistant could not display real-time temperature, wind, or conditions.
+- No differentiation between brief vs. detailed weather queries.
+- No error handling or validation for invalid locations or missing API keys.
+
+### Solution
+
+Key design decisions:
+
+- Replace the placeholder with a real integration using the public WeatherAPI
+- Create a new package internal/tools/weather.go to encapsulate all HTTP calls, parsing, and error handling.
+- Fetch and return live weather data: temperature, wind, humidity, pressure, UV index, and precipitation.
+- Extend the tool’s JSON schema with a new details flag so the LLM can request compact or detailed output.
+- Support missing/invalid keys gracefully by returning a clear "failed to fetch weather" message.
+- Keep the output simple and human-readable for chat responses.
+
+### Implementation
+
+I first implemented the weather tool to get a reduced report, then I extended it so it can get more parameters in case the user asks for more details. It has two modes, at first it will give a summary of the weather and when asked for more details the query will return a more sophisticated report. The implementation is as follows:
+
+#### 1. New weather package
+
+A new helper file [`internal/tools/weather.go`](internal/tools/weather.go) defines the GetCurrent function which interacts with WeatherAPI to get the weather report:
+
+```go
+func GetCurrent(ctx context.Context, location string) (*CurrentReport, error)
+```
+
+This function:
+
+- Reads `WEATHER_API_KEY` from the environment.
+- Calls https://api.weatherapi.com/v1/current.json.
+- Parses relevant fields into a strongly-typed struct.
+
+Report structure:
+
+```go
+type CurrentReport struct {
+    ResolvedName string
+    TemperatureC float64
+    FeelsLikeC   float64
+    WindKph      float64
+    WindDir      string
+    Humidity     int
+    PrecipMm     float64
+    PressureMb   float64
+    Cloud        int
+    UV           float64
+    VisKm        float64
+    Condition    string
+}
+```
+
+This isolates all WeatherAPI logic from the assistant core and makes it reusable for other tasks (like the forecast in the bonus task).
+
+#### 2. Updated assistant logic
+
+The `get_weather` tool in `assistant.go` was replaced with a real call to `weather.GetCurrent`. The function now unmarshals (parses) the model’s arguments which are the location, and if the user asked for details:
+
+```go
+var args struct {
+    Location string `json:"location"`
+    Details  bool   `json:"details,omitempty"`
+}
+```
+
+Then builds a formatted response which includes extra information depending on the user query (`Details`):
+
+```go
+rep, err := weather.GetCurrent(ctx, args.Location)
+if err != nil {
+    msgs = append(msgs, openai.ToolMessage("failed to fetch weather", call.ID))
+    break
+}
+
+var b strings.Builder
+fmt.Fprintf(&b, "Location: %s\n", rep.ResolvedName)
+fmt.Fprintf(&b, "Current: %.1f°C (feels %.1f°C), %s\n", rep.TemperatureC, rep.FeelsLikeC, rep.Condition)
+fmt.Fprintf(&b, "Wind: %.1f km/h %s\n", rep.WindKph, rep.WindDir)
+
+if args.Details {
+    fmt.Fprintf(&b, "Humidity: %d%% | Cloud: %d%% | UV: %.1f\n", rep.Humidity, rep.Cloud, rep.UV)
+    fmt.Fprintf(&b, "Pressure: %.0f mb | Visibility: %.1f km | Precip: %.2f mm\n",
+        rep.PressureMb, rep.VisKm, rep.PrecipMm)
+}
+
+msgs = append(msgs, openai.ToolMessage(b.String(), call.ID))
+```
+
+### Result
+
+In the next conversation thare are two examples of the functionality of `GetCurrent`. One is the basic question with the weather summary as a response, and the next round is the query for more details from the user and the full report answer from the assistant.
+
+```text
+USER:
+What is the weather in Bangkok?
+
+New conversation started:
+ID: 6914eafef885c0ccc206c958
+Title: Bangkok current weather information
+
+ASSISTANT:
+The current weather in Bangkok is 26.2°C (feels like 29.3°C) with moderate or heavy rain and thunder. Winds are coming from the SSE at 5.4 km/h.
+
+USER:
+I want all the weather data you can give me  
+
+ASSISTANT:
+Here is the detailed current weather for Bangkok:
+
+- Temperature: 26.2°C (feels like 29.3°C)
+- Conditions: Moderate or heavy rain with thunder
+- Wind: 5.4 km/h from SSE
+- Humidity: 84%
+- Cloud Cover: 75%
+- UV Index: 0.0
+- Pressure: 1011 mb
+- Visibility: 10.0 km
+- Precipitation: 0.01 mm
+
+Let me know if you need a forecast or more details!
+```
+
+## Task 2 – Bonus: Weather forecast
 
 ## Task 3
 
@@ -214,3 +349,8 @@ This change improves responsiveness while keeping the same functionality and dat
 
 ## Task 5
 
+
+
+## References
+- ChatGPT 5 for coding and syntax
+- WeatherAPI Documentation: https://www.weatherapi.com/docs/
