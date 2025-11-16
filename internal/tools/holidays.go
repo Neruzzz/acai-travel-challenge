@@ -2,7 +2,6 @@ package tools
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -92,7 +91,7 @@ func loadCalendar(ctx context.Context, url string) ([]*ics.VEvent, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		return nil, errors.New(fmt.Sprintf("calendar http %d", resp.StatusCode))
+		return nil, fmt.Errorf("calendar http %d", resp.StatusCode)
 	}
 	cal, err := ics.ParseCalendar(resp.Body)
 	if err != nil {
