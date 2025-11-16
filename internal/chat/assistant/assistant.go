@@ -18,7 +18,19 @@ type Assistant struct {
 }
 
 func New() *Assistant {
-	return &Assistant{cli: openai.NewClient()}
+	a := &Assistant{cli: openai.NewClient()}
+
+	ts := tools.AllTools()
+	if len(ts) == 0 {
+		slog.Warn("No tools registered! Check package names, init() and build tags.")
+	} else {
+		slog.Info("Tools registered", "count", len(ts))
+		for _, t := range ts {
+			slog.Info("Tool registered", "name", t.Name(), "desc", t.Description())
+		}
+	}
+
+	return a
 }
 
 func (a *Assistant) Title(ctx context.Context, conv *model.Conversation) (string, error) {
@@ -75,7 +87,6 @@ func (a *Assistant) Reply(ctx context.Context, conv *model.Conversation) (string
 	}
 	slog.InfoContext(ctx, "Generating reply for conversation", "conversation_id", conv.ID)
 
-	// 1) Construye el historial
 	msgs := []openai.ChatCompletionMessageParamUnion{
 		openai.SystemMessage("You are a helpful, concise AI assistant. Provide accurate, safe, and clear responses."),
 	}
@@ -88,19 +99,18 @@ func (a *Assistant) Reply(ctx context.Context, conv *model.Conversation) (string
 		}
 	}
 
-	// 2) Anuncia dinámicamente TODAS las tools registradas
+	// Dynamic tool exposure
 	var toolDefs []openai.ChatCompletionToolUnionParam
 	for _, t := range tools.AllTools() {
 		toolDefs = append(toolDefs,
 			openai.ChatCompletionFunctionTool(openai.FunctionDefinitionParam{
 				Name:        t.Name(),
 				Description: openai.String(t.Description()),
-				Parameters:  t.ParametersSchema(), // debe ser un objeto JSON válido
+				Parameters:  t.ParametersSchema(),
 			}),
 		)
 	}
 
-	// 3) Bucle de tool-calls
 	for i := 0; i < 15; i++ {
 		resp, err := a.cli.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
 			Model:    openai.ChatModelGPT4_1,
@@ -116,14 +126,11 @@ func (a *Assistant) Reply(ctx context.Context, conv *model.Conversation) (string
 
 		message := resp.Choices[0].Message
 		if len(message.ToolCalls) == 0 {
-			// No hay más tool-calls → respuesta final del asistente
 			return message.Content, nil
 		}
 
-		// Añade el mensaje del asistente que contiene los tool-calls
 		msgs = append(msgs, message.ToParam())
 
-		// Ejecuta cada tool por NOMBRE usando el registro
 		for _, call := range message.ToolCalls {
 			slog.InfoContext(ctx, "Tool call received", "name", call.Function.Name, "args", call.Function.Arguments)
 
@@ -133,7 +140,6 @@ func (a *Assistant) Reply(ctx context.Context, conv *model.Conversation) (string
 				continue
 			}
 
-			// Los argumentos llegan como JSON string → map[string]any
 			var args map[string]any
 			if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
 				msgs = append(msgs, openai.ToolMessage("failed to parse tool arguments: "+err.Error(), call.ID))
@@ -146,7 +152,6 @@ func (a *Assistant) Reply(ctx context.Context, conv *model.Conversation) (string
 				continue
 			}
 
-			// Devuelve el resultado de la tool
 			msgs = append(msgs, openai.ToolMessage(out, call.ID))
 		}
 	}
