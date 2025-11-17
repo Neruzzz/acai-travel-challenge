@@ -1090,7 +1090,51 @@ ok      github.com/Neruzzz/acai-travel-challenge/internal/chat  0.408s
 ## Task 4 – Bonus: Tests for assistant.Title
 ### Problem
 
+We need to develop a test for Assistant.Title (in `internal/chat/assistant/assistant.go`), without coupling to DB code or breaking local runs when OPENAI_API_KEY is absent.
 
+### Solution
+
+- Added a unit test for local logic (fallback when the conversation is empty).
+- Added an optional integration test that calls the real model only if OPENAI_API_KEY is set; otherwise it skips.
+
+### Implementation
+
+The test is implemented in [`internal/chat/assistant/title_test.go`](internal/chat/assistant/title_test.go):
+
+- Created:
+    1. TestTitle_EmptyConversation_Fallback
+        - No network, no DB. Asserts the function returns "An empty conversation" when there are no messages.
+    2. TestTitle_GeneratesConciseTitle_Integration
+        - Skips unless OPENAI_API_KEY is set.
+        - Asserts non-empty, short, cleaned title (no quotes/newlines, not a question mark, length ≤ 80).
+
+### Result
+
+To run the test:
+
+```bash
+make up
+go test ./internal/chat/assistant -v
+```
+
+The result of the test is below:
+
+```text
+trioteca:tech-challenge neruzz$ go test ./internal/chat/assistant -v
+=== RUN   TestTitle_EmptyConversation_Fallback
+2025/11/17 18:30:19 INFO Tools registered count=5
+2025/11/17 18:30:19 INFO Tool registered name=get_current_weather desc="Get current weather for a given location. Returns temperature, wind, humidity, condition, etc."
+2025/11/17 18:30:19 INFO Tool registered name=get_exchange_rate desc="Get the latest FX rate or convert an amount between two currencies (ISO 4217 codes, e.g., EUR, USD). Powered by frankfurter.app, no API key required."
+2025/11/17 18:30:19 INFO Tool registered name=get_holidays desc="Gets local bank and public holidays. Each line is 'YYYY-MM-DD: Holiday Name'."
+2025/11/17 18:30:19 INFO Tool registered name=get_today_date desc="Get today's date and time in RFC3339 format."
+2025/11/17 18:30:19 INFO Tool registered name=get_weather_forecast desc="Provides a multi-day weather forecast (up to 7 days) for a given location."
+--- PASS: TestTitle_EmptyConversation_Fallback (0.00s)
+=== RUN   TestTitle_GeneratesConciseTitle_Integration
+    title_test.go:29: skipping integration test: OPENAI_API_KEY not set
+--- SKIP: TestTitle_GeneratesConciseTitle_Integration (0.00s)
+PASS
+ok      github.com/Neruzzz/acai-travel-challenge/internal/chat/assistant        0.278s
+```
 
 ## Task 5
 
