@@ -1135,6 +1135,7 @@ trioteca:tech-challenge neruzz$ go test ./internal/chat/assistant -v
 PASS
 ok      github.com/Neruzzz/acai-travel-challenge/internal/chat/assistant        0.278s
 ```
+
 The result of the test with `OPENAI_API_KEY` is below:
 
 
@@ -1158,14 +1159,334 @@ The result of the test with `OPENAI_API_KEY` is below:
 --- PASS: TestTitle_GeneratesConciseTitle_Integration (1.33s)
 PASS
 ok      github.com/Neruzzz/acai-travel-challenge/internal/chat/assistant 
-````
-
-## Task 5
+```
 
 
+## Task 5 – Observability: HTTP metrics with OpenTelemetry, Prometheus and Grafana
+### Problem
+
+The original web server did not expose any structured metrics:
+
+- There was no way to see how many requests the server was handling.
+- Response times were invisible, so performance regressions would be hard to detect.
+- Errors (4xx/5xx) were only visible in logs, not aggregated over time.
+- There was no Prometheus / Grafana integration to visualize these metrics.
+
+The challenge asked specifically for:
+
+- Number of requests.
+- Response times.
+- Error rates.
+
+
+### Solution
+
+Key design decisions:
+
+- Use OpenTelemetry SDK for Go as the single instrumentation point.
+- Export metrics via OTLP gRPC to an OpenTelemetry Collector.
+- From the Collector, expose a Prometheus endpoint (/metrics) that Prometheus scrapes.
+- Build a Grafana dashboard on top of the Prometheus data- source, with panels for:
+    - Requests per second.
+    - p95 latency.
+    - Error rate.
+
+At the code level:
+
+- Define custom HTTP metrics:
+    - `acai_http_server_requests_total`: total requests.
+    - `acai_http_server_errors_total`: total error responses (status >= 400).
+    - `acai_http_server_duration_ms_bucket/sum/count`: request latency histogram in ms.
+- Implement a `MetricsMiddleware` that wraps the HTTP handler and updates these metrics for every request.
+- Use `otelhttp.NewHandler` to integrate with OpenTelemetry and reuse its HTTP semantics, but keep the custom metrics as the canonical ones for the challenge requirements.
+
+### Implementation
+#### 1. Telemetry initialization
+
+In `main.go` the server now initializes OpenTelemetry at startup:
+
+```go
+func main() {
+    ctx := context.Background()
+
+    // Initialize OTEL (metrics + traces → OTEL Collector).
+    shutdown, err := httpx.InitTelemetry(ctx, "acai-server")
+    if err != nil {
+        log.Fatalf("telemetry init error: %v", err)
+    }
+    defer func() { _ = shutdown(context.Background()) }()
+    
+    // ...
+}
+```
+
+The function `httpx.InitTelemetry` (in `otel.go`) configures:
+
+- A resource with `service.name="acai-server"`.
+- An OTLP metrics exporter (gRPC) to `localhost:4317`.
+- An OTLP traces exporter (gRPC) to the same endpoint.
+- A MeterProvider with a periodic reader (export every 10s).
+- A TracerProvider with a batch span processor.
+
+Both providers are registered as globals (`otel.SetTracerProvider`, `otel.SetMeterProvider`), and a `Meter()` helper is exposed:
+
+```go
+func Meter() metric.Meter {
+    return otel.Meter("acai-server")
+}
+```
+
+#### 2. HTTP metrics middleware
+
+In `metrics.go` I created three instruments:
+
+```go
+var (
+    reqCounter       metric.Int64Counter
+    errCounter       metric.Int64Counter
+    latencyHistogram metric.Float64Histogram
+)
+
+func init() {
+    m := Meter()
+
+    reqCounter, _ = m.Int64Counter("http.server.requests",
+        metric.WithDescription("Total number of HTTP requests"),
+    )
+    errCounter, _ = m.Int64Counter("http.server.errors",
+        metric.WithDescription("Total number of failed HTTP requests (status >= 400)"),
+    )
+    latencyHistogram, _ = m.Float64Histogram("http.server.duration.ms",
+        metric.WithDescription("Request duration in milliseconds"),
+    )
+}
+```
+
+The `MetricsMiddleware` wraps any `http.Handler` and collects:
+- Request count.
+- Error count (status ≥ 400).
+- Duration in milliseconds.
+
+It uses a custom response writer to capture the status code:
+
+```go
+func MetricsMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        start := time.Now()
+        sw := &statusCapturingWriter{ResponseWriter: w, status: http.StatusOK}
+
+        next.ServeHTTP(sw, r)
+
+        attrs := []attribute.KeyValue{
+            attribute.String("http.method", r.Method),
+            attribute.String("http.route", r.URL.Path),
+            attribute.Int("http.status_code", sw.status),
+        }
+
+        // Total requests
+        reqCounter.Add(r.Context(), 1, metric.WithAttributes(attrs...))
+
+        // Latency histogram
+        latencyHistogram.Record(
+            r.Context(),
+            float64(time.Since(start).Milliseconds()),
+            metric.WithAttributes(attrs...),
+        )
+
+        // Errors (4xx / 5xx)
+        if sw.status >= 400 {
+            errCounter.Add(r.Context(), 1, metric.WithAttributes(attrs...))
+        }
+    })
+}
+```
+
+This middleware is plugged into the Twirp stack in `main.go`:
+
+```go
+twirpHandler := pb.NewChatServiceServer(server, twirp.WithServerJSONSkipDefaults(true))
+
+instrumentedTwirp := otelhttp.NewHandler(
+    httpx.MetricsMiddleware(twirpHandler), // custom metrics on top of OTEL HTTP handler
+    "twirp.chatservice",
+)
+
+r.PathPrefix("/twirp/").Handler(instrumentedTwirp)
+```
+
+This ensures every request to `/twirp/...` is:
+- Measured by the OpenTelemetry HTTP instrumentation, and
+- Counted and timed by our custom metrics.
+
+#### 3. OTEL Collector, Prometheus and Grafana
+
+I added an OpenTelemetry Collector service and wired it to Prometheus and Jaeger. The collector receives OTLP traffic on 0.0.0.0:4317 (gRPC) and 0.0.0.0:4318 (HTTP).
+
+It exports:
+- Metrics to Prometheus via the prometheus exporter on :8889.
+- Traces to Jaeger via OTLP (jaeger:4317).
+
+Prometheus is configured (`prometheus.yml`) to scrape:
+
+```yaml
+scrape_configs:
+  - job_name: "otel-collector"
+    static_configs:
+      - targets: ["otel-collector:8889"]
+```
+
+Grafana is configured with a Prometheus data source:
+
+`URL: http://prometheus:9090`
+
+On top of that I built a dashboard with three core panels:
+
+- Requests per second (RPS)
+
+```text
+sum by (http_route) (
+  rate(acai_http_server_requests_total[1m])
+)
+```
+
+- p95 latency (ms)
+
+```text
+histogram_quantile(
+  0.95,
+  sum by (le, http_route) (
+    rate(acai_http_server_duration_ms_bucket[5m])
+  )
+)
+```
+
+- Error rate
+
+```text
+sum(rate(acai_http_server_errors_total[5m]))
+/
+sum(rate(acai_http_server_requests_total[5m]))
+```
+
+These metrics are exposed by the Collector with the `acai_ prefix` (for example `acai_http_server_requests_total`, `acai_http_server_duration_ms_*`, `acai_http_server_errors_total`).
+
+### Result
+
+The server now exposes high-level HTTP metrics that match the challenge requirements:
+
+- Number of requests: `acai_http_server_requests_total` and derived RPS dashboard.
+- Response times: `acai_http_server_duration_ms_*` with p95 latency graph.
+- Error rate: `acai_http_server_errors_total / acai_http_server_requests_total`.
+
+Prometheus scrapes the OTEL Collector, and Grafana displays a live dashboard with:
+
+- Traffic per endpoint.
+- Latency distribution over time.
+- Percentage of failing requests.
+
+This makes it easy to spot regressions, slow endpoints or spikes in error rates.
+
+Grafana dashboard with RPS, latency and error rate panels:
+
+![Grafana dashboard](doc/img/grafana.png)
+
+## Task 5 – Bonus: Request tracing with OpenTelemetry and Jaeger
+### Problem
+
+Even with metrics in place, it was still hard to understand how individual requests flowed through the application. The challenge proposed adding tracing as a bonus to visualize request flow.
+
+### Solution
+
+Key design decisions:
+
+- Reuse the same OpenTelemetry setup and export traces via OTLP gRPC to the Collector.
+- From the Collector, send traces to Jaeger using OTLP (`jaeger:4317`).
+- Instrument the HTTP server with `otelhttp.NewHandler` so that each incoming HTTP request creates a root span.
+- Use the same `service.name="acai-server"` resource so that the service appears clearly in Jaeger’s UI.
+
+### Implementation
+#### 1. Tracer provider and OTLP exporter
+
+In `httpx.InitTelemetry` (same function used for metrics) I configured the tracing pipeline:
+
+```go
+traceExp, err := otlptracegrpc.New(
+    initCtx,
+    otlptracegrpc.WithInsecure(),
+    otlptracegrpc.WithEndpoint("localhost:4317"),
+    otlptracegrpc.WithDialOption(grpc.WithBlock()),
+)
+if err != nil {
+    return nil, fmt.Errorf("create trace exporter: %w", err)
+}
+
+tp := sdktrace.NewTracerProvider(
+    sdktrace.WithResource(res),
+    sdktrace.WithBatcher(traceExp,
+        sdktrace.WithExportTimeout(10*time.Second),
+        sdktrace.WithMaxExportBatchSize(512),
+    ),
+)
+
+otel.SetTracerProvider(tp)
+```
+
+The same OTEL Collector configuration that exposes Prometheus metrics also forwards traces to Jaeger via the otlp exporter.
+
+#### 2. HTTP request spans
+
+By wrapping the Twirp handler with otelhttp.NewHandler in `main.go`:
+
+```go
+twirpHandler := pb.NewChatServiceServer(server, twirp.WithServerJSONSkipDefaults(true))
+
+instrumentedTwirp := otelhttp.NewHandler(
+    httpx.MetricsMiddleware(twirpHandler),
+    "twirp.chatservice",
+)
+
+r.PathPrefix("/twirp/").Handler(instrumentedTwirp)
+```
+
+Each HTTP request automatically creates a span with attributes such as:
+
+- `http.method`
+- `http.route`
+- `http.status_code`
+- `net.peer.ip`, etc.
+
+These spans are exported via OTLP to the Collector and then to Jaeger.
+
+#### 3. Inspecting traces in Jaeger
+
+The Jaeger all-in-one container runs the UI on `http://localhost:16686`.
+
+In the UI:
+
+- The service appears as acai-server (from the OTEL resource).
+- Each call to /twirp/acai.chat.ChatService/... shows up as a trace, with:
+    - Operation name twirp.chatservice.
+    - Start time and duration.
+    - HTTP attributes and status code.
+
+This makes it straightforward to:
+
+- Correlate slow responses with their spans.
+- See whether errors are coming from HTTP, the assistant logic, or external tools.
+
+### Result
+
+Jaeger provides a timeline view of requests, with span durations and metadata. Combined with the metrics dashboard, the service now has a complete basic observability stack: metrics + traces.
+
+Jaeger UI with recorded traces for acai-server:
+
+![Jaeger UI](doc/img/jaeger.png)
 
 ## References
 - ChatGPT 5 for coding and syntax.
 - WeatherAPI Documentation: https://www.weatherapi.com/docs/
 - For deeper understanding of syntax and primitives in Go: https://go.dev/doc/
-- Frankfurter API for exange rates tool: https://www.frankfurter.dev
+- Frankfurter API for exchange rates tool: https://www.frankfurter.dev
+- Grafana Documentation: https://grafana.com/docs/
+- Prometheus Documentation: https://prometheus.io/docs/
+- Jaeger Documentation: https://www.jaegertracing.io/docs/
